@@ -4,10 +4,16 @@ version = "0.1.0"
 description = "Generate episode Excel with embedded images"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "openpyxl>=3.1.5",
+    "pillow>=12.1.1",
+    "python-docx>=1.2.0",
+    "regex>=2026.2.19",
+    "typer>=0.24.1",
+]
 
 [project.scripts]
-excel-pic = "excel_pic:main"
+excel-pic = "excel_pic:run"
 
 [build-system]
 requires = ["hatchling"]
