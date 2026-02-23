@@ -70,9 +70,9 @@ def test_run_generation_success(tmp_path: Path) -> None:
     assert ws.cell(1, 3).value == "图片"
     assert ws.cell(2, 1).value == "21-1"
     assert str(ws.cell(2, 2).value).startswith("PREFIX\n")
-    # in-cell 图片不会出现在 openpyxl 的浮动图片集合中。
+    # DISPIMG 是单元格公式，不会出现在浮动图片集合中。
     assert len(getattr(ws, "_images", [])) == 0
-    assert ws.cell(2, 3).value == "#VALUE!"
+    assert str(ws.cell(2, 3).value).startswith("=_xlfn.DISPIMG(")
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["status"] == "success"
@@ -228,10 +228,16 @@ def test_images_embedded_in_cells_not_floating_drawings(tmp_path: Path) -> None:
     with ZipFile(excel_path) as zf:
         names = set(zf.namelist())
         sheet_xml = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        workbook_rels = zf.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+        cellimages_xml = zf.read("xl/cellimages.xml").decode("utf-8")
 
     # 没有 drawing，说明不是传统浮动图片。
     assert not any(name.startswith("xl/drawings/") for name in names)
-    # richData 元数据存在，说明使用了单元格内嵌图片能力。
-    assert "xl/richData/rdrichvalue.xml" in names
-    # 第一条分镜对应 C2 单元格。
+    # WPS cellimages 结构存在。
+    assert "xl/cellimages.xml" in names
+    assert "xl/_rels/cellimages.xml.rels" in names
+    assert "officeDocument/2020/cellImage" in workbook_rels
+    # 第一条分镜对应 C2 单元格 DISPIMG 公式。
     assert 'r="C2"' in sheet_xml
+    assert "_xlfn.DISPIMG" in sheet_xml
+    assert "<etc:cellImages" in cellimages_xml

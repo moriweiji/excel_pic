@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import html
 import json
 import re
 import shutil
 import sys
+import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
+from xml.etree import ElementTree as ET
 
 import regex
 import typer
@@ -35,6 +38,8 @@ MAX_EXCEL_ROW_HEIGHT = 409
 ROW_LINE_HEIGHT_PT = 20
 ROW_BASE_PADDING_PT = 16
 IMAGE_PADDING_PX = 8
+WPS_CELLIMAGE_REL_TYPE = "http://www.wps.cn/officeDocument/2020/cellImage"
+WPS_CELLIMAGE_CONTENT_TYPE = "application/vnd.wps-officedocument.cellimage+xml"
 RESERVED_WINDOWS_NAMES = {
     "CON",
     "PRN",
@@ -361,6 +366,139 @@ def calc_image_size_by_column(img_path: Path, col_width: float | None) -> tuple[
     return target_w, max(40, int(target_w * ratio))
 
 
+def image_content_type_from_suffix(suffix: str) -> str:
+    ext = suffix.lower().lstrip(".")
+    if ext in {"jpg", "jpeg"}:
+        return "image/jpeg"
+    if ext == "png":
+        return "image/png"
+    if ext == "bmp":
+        return "image/bmp"
+    if ext == "webp":
+        return "image/webp"
+    # 回退为二进制流，避免未知后缀导致文件损坏。
+    return "application/octet-stream"
+
+
+def next_rid_for_relationships(root: ET.Element) -> str:
+    max_id = 0
+    for rel in root:
+        rid = rel.attrib.get("Id", "")
+        m = re.match(r"rId(\d+)$", rid)
+        if m:
+            max_id = max(max_id, int(m.group(1)))
+    return f"rId{max_id + 1}"
+
+
+def patch_wps_cellimages(excel_path: Path, image_bindings: list[tuple[str, Path]]) -> None:
+    """
+    Inject WPS cell-image parts so DISPIMG() can render images in WPS as in-cell images.
+    """
+    if not image_bindings:
+        return
+
+    with zipfile.ZipFile(excel_path, "r") as zin:
+        parts = {name: zin.read(name) for name in zin.namelist()}
+
+    # 1) 写入 media 文件并构建 cellimages.xml / rels 内容。
+    cell_images_xml: list[str] = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<etc:cellImages xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:etc="http://www.wps.cn/officeDocument/2017/etCustomData">',
+    ]
+    rels_xml: list[str] = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    ]
+    used_suffixes: set[str] = set()
+
+    for idx, (image_id, image_path) in enumerate(image_bindings, start=1):
+        suffix = image_path.suffix.lower() or ".png"
+        used_suffixes.add(suffix.lstrip("."))
+        media_name = f"image{idx}{suffix}"
+        media_part = f"xl/media/{media_name}"
+        parts[media_part] = image_path.read_bytes()
+
+        with Image.open(image_path) as raw:
+            src_w, src_h = raw.size
+        cx = max(1, int(src_w * 9525))
+        cy = max(1, int(src_h * 9525))
+
+        rel_id = f"rId{idx}"
+        safe_name = html.escape(image_id, quote=True)
+        safe_descr = html.escape(image_path.stem, quote=True)
+
+        cell_images_xml.append(
+            "<etc:cellImage><xdr:pic>"
+            f'<xdr:nvPicPr><xdr:cNvPr id="{idx + 1}" name="{safe_name}" descr="{safe_descr}"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+            f'<xdr:blipFill><a:blip r:embed="{rel_id}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+            f'<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>'
+            "</xdr:pic></etc:cellImage>"
+        )
+        rels_xml.append(
+            f'<Relationship Id="{rel_id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+            f'Target="media/{media_name}"/>'
+        )
+
+    cell_images_xml.append("</etc:cellImages>")
+    rels_xml.append("</Relationships>")
+
+    parts["xl/cellimages.xml"] = "".join(cell_images_xml).encode("utf-8")
+    parts["xl/_rels/cellimages.xml.rels"] = "".join(rels_xml).encode("utf-8")
+
+    # 2) 给 workbook.xml.rels 增加 cellimages 关系。
+    rel_ns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+    wb_rels_root = ET.fromstring(parts["xl/_rels/workbook.xml.rels"])
+    has_cell_rel = any(child.attrib.get("Type") == WPS_CELLIMAGE_REL_TYPE for child in wb_rels_root)
+    if not has_cell_rel:
+        next_rid = next_rid_for_relationships(wb_rels_root)
+        ET.SubElement(
+            wb_rels_root,
+            "{http://schemas.openxmlformats.org/package/2006/relationships}Relationship",
+            {
+                "Id": next_rid,
+                "Type": WPS_CELLIMAGE_REL_TYPE,
+                "Target": "cellimages.xml",
+            },
+        )
+    parts["xl/_rels/workbook.xml.rels"] = ET.tostring(wb_rels_root, encoding="utf-8", xml_declaration=True)
+
+    # 3) 更新 [Content_Types].xml，补充 cellimages override 与图片类型。
+    ct_root = ET.fromstring(parts["[Content_Types].xml"])
+    existing_default_exts = {
+        e.attrib.get("Extension", "").lower()
+        for e in ct_root.findall("{http://schemas.openxmlformats.org/package/2006/content-types}Default")
+    }
+    for ext in sorted(used_suffixes):
+        if ext not in existing_default_exts:
+            ET.SubElement(
+                ct_root,
+                "{http://schemas.openxmlformats.org/package/2006/content-types}Default",
+                {"Extension": ext, "ContentType": image_content_type_from_suffix(ext)},
+            )
+
+    has_cell_override = any(
+        e.attrib.get("PartName") == "/xl/cellimages.xml"
+        for e in ct_root.findall("{http://schemas.openxmlformats.org/package/2006/content-types}Override")
+    )
+    if not has_cell_override:
+        ET.SubElement(
+            ct_root,
+            "{http://schemas.openxmlformats.org/package/2006/content-types}Override",
+            {"PartName": "/xl/cellimages.xml", "ContentType": WPS_CELLIMAGE_CONTENT_TYPE},
+        )
+    parts["[Content_Types].xml"] = ET.tostring(ct_root, encoding="utf-8", xml_declaration=True)
+
+    # 4) 写回 zip。
+    tmp_path = excel_path.with_suffix(".tmp.xlsx")
+    with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in parts.items():
+            zout.writestr(name, data)
+    tmp_path.replace(excel_path)
+
+
 def build_excel(
     excel_path: Path,
     episode_id: str,
@@ -429,18 +567,28 @@ def build_excel(
     ws.write(0, 1, "提示词", header_fmt)
     ws.write(0, 2, "图片", header_fmt)
 
+    image_bindings: list[tuple[str, Path]] = []
     for row_idx, (scene_key, prompt, img_path, row_height_pt) in enumerate(prepared_rows, start=1):
         ws.set_row(row_idx, row_height_pt)
         ws.write(row_idx, 0, scene_key, title_fmt)
         ws.write(row_idx, 1, prompt, prompt_fmt)
-        ws.write_blank(row_idx, 2, None, image_cell_fmt)
         if img_path is not None:
-            # 使用 Excel 365 的 Place in Cell 语义，避免浮动图层。
-            ws.embed_image(row_idx, 2, str(img_path))
+            image_id = f"ID_{uuid.uuid4().hex.upper()}"
+            ws.write_formula(
+                row_idx,
+                2,
+                f'=_xlfn.DISPIMG("{image_id}",1)',
+                image_cell_fmt,
+                f'=DISPIMG("{image_id}",1)',
+            )
+            image_bindings.append((image_id, img_path))
+        else:
+            ws.write_blank(row_idx, 2, None, image_cell_fmt)
 
     try:
         wb.close()
-    except (PermissionError, FileCreateError) as exc:
+        patch_wps_cellimages(excel_path, image_bindings)
+    except (PermissionError, FileCreateError, OSError, zipfile.BadZipFile) as exc:
         raise AppError("E006", "Excel 写入失败，可能被占用，请关闭后重试。") from exc
 
 
