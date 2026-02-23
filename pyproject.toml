@@ -12,6 +12,12 @@ dependencies = [
     "typer>=0.24.1",
 ]
 
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.15.0",
+    "pytest>=8.4.2",
+]
+
 [project.scripts]
 excel-pic = "excel_pic:run"
 excel-pic-gui = "excel_pic.gui:run"

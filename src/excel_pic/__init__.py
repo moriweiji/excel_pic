@@ -107,7 +107,7 @@ def derive_export_name_from_images_dir(images_dir: Path) -> str:
     return output_name
 
 
-def get_output_paths(exe_dir: Path, images_dir: Path) -> tuple[Path, Path, Path, Path]:
+def get_output_paths(exe_dir: Path, images_dir: Path) -> tuple[Path, Path, Path, Path, Path]:
     data_dir = exe_dir / "data"
     config_dir = data_dir / "config"
     export_root = data_dir / "export"
