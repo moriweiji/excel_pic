@@ -51,3 +51,15 @@ Options:
 - Excel images are embedded (not external links), so the export folder can be zipped and shared.
 - Source assets are not modified.
 - This public repository intentionally excludes local docs and sample assets.
+
+## Release (Windows exe)
+
+Tag and push a version to trigger GitHub Release build:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow will attach `excel-pic-gui.exe` and `SHA256SUMS.txt` to the GitHub Release.
+
