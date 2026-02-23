@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from xml.etree import ElementTree as ET
+from zipfile import ZipFile
 from pathlib import Path
 
 import pytest
@@ -8,7 +10,7 @@ from docx import Document
 from openpyxl import load_workbook
 from PIL import Image
 
-from excel_pic import AppError, derive_export_name_from_images_dir, run_generation
+from excel_pic import AppError, derive_export_name_from_images_dir, excel_col_width_to_pixels, run_generation
 
 
 def _create_image(path: Path, color: tuple[int, int, int] = (255, 0, 0)) -> None:
@@ -202,3 +204,39 @@ def test_corrupted_image_warns_in_non_strict_mode(tmp_path: Path) -> None:
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert any(x["code"] == "W005" for x in report["warnings"])
+
+
+def test_images_anchor_in_c_column_and_fit_width(tmp_path: Path) -> None:
+    images_dir = tmp_path / "第21集"
+    images_dir.mkdir()
+    _create_image(images_dir / "21-1.png")
+
+    word_file = tmp_path / "剧情分镜.docx"
+    _create_docx(word_file, ["21-1-0 [黑屏] 黑色转场，", "21-1-1 [全景] 内容1"])
+
+    exe_dir = tmp_path / "runtime"
+    _export_dir, excel_path, _report_path = run_generation(
+        images_dir=images_dir,
+        word_file=word_file,
+        strict=False,
+        prefix_text_override="PREFIX",
+        exe_dir=exe_dir,
+        confirm_overwrite=lambda _p: True,
+    )
+
+    wb = load_workbook(excel_path)
+    ws = wb.active
+    c_col_px = excel_col_width_to_pixels(ws.column_dimensions["C"].width)
+
+    with ZipFile(excel_path) as zf:
+        drawing = zf.read("xl/drawings/drawing1.xml")
+    root = ET.fromstring(drawing)
+    ns = {"xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"}
+
+    from_col = root.find(".//xdr:oneCellAnchor/xdr:from/xdr:col", ns)
+    assert from_col is not None and from_col.text == "2"  # 0-based: 2 => C列
+
+    ext = root.find(".//xdr:oneCellAnchor/xdr:ext", ns)
+    assert ext is not None
+    img_width_px = int(ext.attrib["cx"]) // 9525
+    assert img_width_px <= c_col_px

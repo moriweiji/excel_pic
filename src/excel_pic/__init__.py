@@ -32,6 +32,10 @@ SHOT_RE = re.compile(r"^(?P<episode>\d+)-(?P<scene>\d+)-(?P<shot>\d+)\s+")
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 MAX_EXCEL_CELL_LEN = 32767
 MAX_WIN_PATH_LEN = 240
+MAX_EXCEL_ROW_HEIGHT = 409
+ROW_LINE_HEIGHT_PT = 20
+ROW_BASE_PADDING_PT = 16
+IMAGE_PADDING_PX = 8
 RESERVED_WINDOWS_NAMES = {
     "CON",
     "PRN",
@@ -325,6 +329,39 @@ def map_images_to_scenes(
     return scene_to_image
 
 
+def excel_col_width_to_pixels(width: float | None) -> int:
+    """Approximate Excel conversion from column-width units to pixels."""
+    if width is None:
+        width = 8.43
+    if width <= 0:
+        return 0
+    if width < 1:
+        return int(width * 12 + 0.5)
+    return int(width * 7 + 5)
+
+
+def pixels_to_points(px: int) -> float:
+    return px * 0.75
+
+
+def estimate_row_text_height_pt(prompt: str) -> float:
+    line_count = prompt.count("\n") + 1
+    return ROW_BASE_PADDING_PT + line_count * ROW_LINE_HEIGHT_PT
+
+
+def calc_image_size_by_column(img_path: Path, col_width: float | None) -> tuple[int, int]:
+    col_px = excel_col_width_to_pixels(col_width)
+    target_w = max(60, col_px - IMAGE_PADDING_PX * 2)
+    with Image.open(img_path) as raw:
+        src_w, src_h = raw.size
+
+    if src_w <= 0 or src_h <= 0:
+        return target_w, max(40, int(target_w * 9 / 16))
+
+    ratio = src_h / src_w
+    return target_w, max(40, int(target_w * ratio))
+
+
 def build_excel(
     excel_path: Path,
     episode_id: str,
@@ -341,9 +378,10 @@ def build_excel(
     thin = Side(style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    ws.column_dimensions["A"].width = 14
-    ws.column_dimensions["B"].width = 92
-    ws.column_dimensions["C"].width = 44
+    # 靠近样例模板的列宽，保证图片落在 C 列可视区域内。
+    ws.column_dimensions["A"].width = 11.88
+    ws.column_dimensions["B"].width = 88.38
+    ws.column_dimensions["C"].width = 52.89
 
     for row in ws.iter_rows(min_row=1, max_row=1, min_col=1, max_col=3):
         for cell in row:
@@ -371,16 +409,18 @@ def build_excel(
         for col in (1, 2, 3):
             ws.cell(row=row_idx, column=col).border = border
 
+        row_height_pt = estimate_row_text_height_pt(prompt)
         if scene in scene_to_image:
             img_path = scene_to_image[scene]
             img = XLImage(str(img_path))
-            img.width = 360
-            img.height = 200
+            img_w, img_h = calc_image_size_by_column(img_path, ws.column_dimensions["C"].width)
+            img.width = img_w
+            img.height = img_h
             img.anchor = f"C{row_idx}"
             ws.add_image(img)
-            ws.row_dimensions[row_idx].height = 170
-        else:
-            ws.row_dimensions[row_idx].height = 80
+            row_height_pt = max(row_height_pt, pixels_to_points(img_h + IMAGE_PADDING_PX * 2))
+
+        ws.row_dimensions[row_idx].height = min(row_height_pt, MAX_EXCEL_ROW_HEIGHT)
 
         row_idx += 1
 
