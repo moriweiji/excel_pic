@@ -1,0 +1,13 @@
+.DS_Store
+.idea/
+.vscode/
+.venv/
+__pycache__/
+*.pyc
+
+# Local outputs
+data/
+
+# Local analysis and sample assets (do not publish)
+docs/
+第21集/

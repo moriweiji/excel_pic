@@ -1,0 +1,14 @@
+[project]
+name = "excel-pic"
+version = "0.1.0"
+description = "Generate episode Excel with embedded images"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+excel-pic = "excel_pic:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
