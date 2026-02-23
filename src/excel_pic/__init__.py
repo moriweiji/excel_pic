@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import regex
 import typer
@@ -40,12 +41,16 @@ RESERVED_WINDOWS_NAMES = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 
+LogSink = Callable[[str, str], None]
+
 
 class AppError(Exception):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.log_path: Path | None = None
+        self.report_path: Path | None = None
 
 
 @dataclass
@@ -53,23 +58,38 @@ class LogReport:
     errors: list[dict]
     warnings: list[dict]
     infos: list[str]
+    sink: LogSink | None
 
-    def __init__(self) -> None:
+    def __init__(self, sink: LogSink | None = None) -> None:
         self.errors = []
         self.warnings = []
         self.infos = []
+        self.sink = sink
+
+    def _emit(self, level: str, message: str) -> None:
+        if self.sink:
+            self.sink(level, message)
+        else:
+            typer.echo(f"[{level}] {message}")
 
     def info(self, message: str) -> None:
         self.infos.append(message)
-        typer.echo(f"[INFO] {message}")
+        self._emit("INFO", message)
 
     def warning(self, code: str, message: str, detail: str = "") -> None:
         self.warnings.append({"code": code, "message": message, "detail": detail})
-        typer.echo(f"[WARN] {message}")
+        self._emit("WARN", message)
 
     def error(self, code: str, message: str, detail: str = "") -> None:
         self.errors.append({"code": code, "message": message, "detail": detail})
-        typer.echo(f"[ERROR] {message}")
+        self._emit("ERROR", message)
+
+
+def detect_runtime_dir() -> Path:
+    """Return executable directory when frozen, otherwise current working directory."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path.cwd()
 
 
 def sanitize_windows_name(name: str) -> str:
@@ -78,6 +98,23 @@ def sanitize_windows_name(name: str) -> str:
     if cleaned.upper() in RESERVED_WINDOWS_NAMES:
         cleaned = f"_{cleaned}_"
     return cleaned
+
+
+def derive_export_name_from_images_dir(images_dir: Path) -> str:
+    output_name = sanitize_windows_name(images_dir.name)
+    if not output_name:
+        raise AppError("E007", "输入目录名包含系统不允许的字符，请修改目录名后重试。")
+    return output_name
+
+
+def get_output_paths(exe_dir: Path, images_dir: Path) -> tuple[Path, Path, Path, Path]:
+    data_dir = exe_dir / "data"
+    config_dir = data_dir / "config"
+    export_root = data_dir / "export"
+    logs_dir = data_dir / "logs"
+    export_name = derive_export_name_from_images_dir(images_dir)
+    export_dir = export_root / export_name
+    return data_dir, config_dir, export_root, logs_dir, export_dir
 
 
 def validate_writable_dir(path: Path) -> None:
@@ -357,8 +394,8 @@ def write_log_and_report(
     logs_dir: Path,
     input_name: str,
     report: LogReport,
-    export_dir: Path,
-    excel_path: Path,
+    export_dir: Path | None,
+    excel_path: Path | None,
 ) -> tuple[Path, Path]:
     logs_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -378,8 +415,8 @@ def write_log_and_report(
 
     report_obj = {
         "status": "failed" if report.errors else "success",
-        "export_dir": str(export_dir),
-        "excel": str(excel_path),
+        "export_dir": str(export_dir) if export_dir else None,
+        "excel": str(excel_path) if excel_path else None,
         "errors": report.errors,
         "warnings": report.warnings,
     }
@@ -394,63 +431,70 @@ def run_generation(
     strict: bool,
     prefix_text_override: str | None,
     exe_dir: Path,
+    confirm_overwrite: Callable[[Path], bool] | None = None,
+    log_sink: LogSink | None = None,
 ) -> tuple[Path, Path, Path]:
-    report = LogReport()
+    report = LogReport(sink=log_sink)
 
-    data_dir = exe_dir / "data"
-    config_dir = data_dir / "config"
-    export_root = data_dir / "export"
-    logs_dir = data_dir / "logs"
+    data_dir, config_dir, _export_root, logs_dir, export_dir = get_output_paths(exe_dir, images_dir)
+    output_name = export_dir.name or "unknown"
+    excel_path: Path | None = None
 
-    validate_writable_dir(data_dir)
+    try:
+        validate_writable_dir(data_dir)
+        check_path_length(export_dir)
 
-    input_name = images_dir.name
-    output_name = sanitize_windows_name(input_name)
-    if not output_name:
-        raise AppError("E007", "输入目录名包含系统不允许的字符，请修改目录名后重试。")
+        prefix_text = get_prefix_template(config_dir, prefix_text_override)
 
-    export_dir = export_root / output_name
-    check_path_length(export_dir)
+        if export_dir.exists():
+            if confirm_overwrite is None:
+                answer = typer.confirm(f"导出目录已存在：{export_dir}。是否覆盖？", default=False)
+            else:
+                answer = confirm_overwrite(export_dir)
+            if not answer:
+                raise AppError("E012", "已取消覆盖，流程终止。")
+            shutil.rmtree(export_dir)
 
-    prefix_text = get_prefix_template(config_dir, prefix_text_override)
+        export_dir.mkdir(parents=True, exist_ok=True)
 
-    if export_dir.exists():
-        answer = typer.confirm(f"导出目录已存在：{export_dir}。是否覆盖？", default=False)
-        if not answer:
-            raise AppError("E012", "已取消覆盖，流程终止。")
-        shutil.rmtree(export_dir)
+        report.info(f"读取图片目录：{images_dir}")
+        copied_images = copy_images(images_dir, export_dir, strict, report)
 
-    export_dir.mkdir(parents=True, exist_ok=True)
+        report.info(f"读取Word文件：{word_file}")
+        lines = collect_docx_lines(word_file, report)
 
-    report.info(f"读取图片目录：{images_dir}")
-    copied_images = copy_images(images_dir, export_dir, strict, report)
+        episode_id = parse_episode_id(images_dir.name, lines)
+        scene_groups = extract_scene_groups(lines, episode_id, report)
 
-    report.info(f"读取Word文件：{word_file}")
-    lines = collect_docx_lines(word_file, report)
+        scene_numbers = sorted(scene_groups.keys())
+        scene_to_image = map_images_to_scenes(copied_images, episode_id, scene_numbers, report)
 
-    episode_id = parse_episode_id(input_name, lines)
-    scene_groups = extract_scene_groups(lines, episode_id, report)
+        excel_name = f"{episode_id}集.xlsx"
+        excel_path = export_dir / excel_name
+        check_path_length(excel_path)
 
-    scene_numbers = sorted(scene_groups.keys())
-    scene_to_image = map_images_to_scenes(copied_images, episode_id, scene_numbers, report)
+        report.info(f"生成Excel：{excel_path}")
+        build_excel(excel_path, episode_id, scene_groups, scene_to_image, prefix_text)
 
-    excel_name = f"{episode_id}集.xlsx"
-    excel_path = export_dir / excel_name
-    check_path_length(excel_path)
-
-    report.info(f"生成Excel：{excel_path}")
-    build_excel(excel_path, episode_id, scene_groups, scene_to_image, prefix_text)
-
-    log_path, report_path = write_log_and_report(logs_dir, output_name, report, export_dir, excel_path)
-    return export_dir, excel_path, report_path
+        log_path, report_path = write_log_and_report(logs_dir, output_name, report, export_dir, excel_path)
+        return export_dir, excel_path, report_path
+    except AppError as exc:
+        report.error(exc.code, exc.message)
+        try:
+            log_path, report_path = write_log_and_report(logs_dir, output_name, report, export_dir, excel_path)
+            exc.log_path = log_path
+            exc.report_path = report_path
+        except Exception:
+            pass
+        raise
 
 
 def cli(
-    images_dir: Path = typer.Option(..., "--images-dir", "-i", exists=True, file_okay=False, dir_okay=True, resolve_path=True, help="图片源目录"),
-    word_file: Path = typer.Option(..., "--word", "-w", exists=True, file_okay=True, dir_okay=False, resolve_path=True, help="Word路径(.docx)"),
+    images_dir: Path = typer.Option(..., "--images-dir", "-i", file_okay=False, dir_okay=True, resolve_path=True, help="图片源目录"),
+    word_file: Path = typer.Option(..., "--word", "-w", file_okay=True, dir_okay=False, resolve_path=True, help="Word路径(.docx)"),
     strict: bool = typer.Option(False, "--strict", help="严格模式：坏图等问题直接中断"),
     prefix_text: str | None = typer.Option(None, "--prefix-text", help="可选：直接传入前缀模板文本"),
-    exe_dir: Path = typer.Option(Path.cwd(), "--exe-dir", help="exe同级目录（开发调试可改）"),
+    exe_dir: Path = typer.Option(detect_runtime_dir(), "--exe-dir", help="exe同级目录（开发调试可改）"),
 ) -> None:
     """Generate an Excel file with embedded images from one episode folder."""
     try:
@@ -464,6 +508,10 @@ def cli(
         typer.echo(f"\n完成：\n- 导出目录: {export_dir}\n- Excel: {excel_path}\n- 报告: {report_path}")
     except AppError as exc:
         typer.echo(f"失败 [{exc.code}] {exc.message}")
+        if exc.log_path:
+            typer.echo(f"- 日志: {exc.log_path}")
+        if exc.report_path:
+            typer.echo(f"- 报告: {exc.report_path}")
         raise typer.Exit(code=1)
 
 

@@ -19,6 +19,12 @@ uv sync
 uv run excel-pic -i "第21集" -w "第21集/剧情分镜（21-30）.docx" --exe-dir .
 ```
 
+## Run GUI
+
+```bash
+uv run excel-pic-gui
+```
+
 Options:
 
 - `-i, --images-dir` 图片源目录

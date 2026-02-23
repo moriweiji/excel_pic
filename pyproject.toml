@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 excel-pic = "excel_pic:run"
+excel-pic-gui = "excel_pic.gui:run"
 
 [build-system]
 requires = ["hatchling"]
