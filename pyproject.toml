@@ -10,6 +10,7 @@ dependencies = [
     "python-docx>=1.2.0",
     "regex>=2026.2.19",
     "typer>=0.24.1",
+    "xlsxwriter>=3.2.9",
 ]
 
 [dependency-groups]

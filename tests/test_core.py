@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 from pathlib import Path
 
@@ -10,7 +9,7 @@ from docx import Document
 from openpyxl import load_workbook
 from PIL import Image
 
-from excel_pic import AppError, derive_export_name_from_images_dir, excel_col_width_to_pixels, run_generation
+from excel_pic import AppError, derive_export_name_from_images_dir, run_generation
 
 
 def _create_image(path: Path, color: tuple[int, int, int] = (255, 0, 0)) -> None:
@@ -71,7 +70,9 @@ def test_run_generation_success(tmp_path: Path) -> None:
     assert ws.cell(1, 3).value == "图片"
     assert ws.cell(2, 1).value == "21-1"
     assert str(ws.cell(2, 2).value).startswith("PREFIX\n")
-    assert len(getattr(ws, "_images", [])) == 2
+    # in-cell 图片不会出现在 openpyxl 的浮动图片集合中。
+    assert len(getattr(ws, "_images", [])) == 0
+    assert ws.cell(2, 3).value == "#VALUE!"
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["status"] == "success"
@@ -206,7 +207,7 @@ def test_corrupted_image_warns_in_non_strict_mode(tmp_path: Path) -> None:
     assert any(x["code"] == "W005" for x in report["warnings"])
 
 
-def test_images_anchor_in_c_column_and_fit_width(tmp_path: Path) -> None:
+def test_images_embedded_in_cells_not_floating_drawings(tmp_path: Path) -> None:
     images_dir = tmp_path / "第21集"
     images_dir.mkdir()
     _create_image(images_dir / "21-1.png")
@@ -224,19 +225,13 @@ def test_images_anchor_in_c_column_and_fit_width(tmp_path: Path) -> None:
         confirm_overwrite=lambda _p: True,
     )
 
-    wb = load_workbook(excel_path)
-    ws = wb.active
-    c_col_px = excel_col_width_to_pixels(ws.column_dimensions["C"].width)
-
     with ZipFile(excel_path) as zf:
-        drawing = zf.read("xl/drawings/drawing1.xml")
-    root = ET.fromstring(drawing)
-    ns = {"xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"}
+        names = set(zf.namelist())
+        sheet_xml = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
 
-    from_col = root.find(".//xdr:oneCellAnchor/xdr:from/xdr:col", ns)
-    assert from_col is not None and from_col.text == "2"  # 0-based: 2 => C列
-
-    ext = root.find(".//xdr:oneCellAnchor/xdr:ext", ns)
-    assert ext is not None
-    img_width_px = int(ext.attrib["cx"]) // 9525
-    assert img_width_px <= c_col_px
+    # 没有 drawing，说明不是传统浮动图片。
+    assert not any(name.startswith("xl/drawings/") for name in names)
+    # richData 元数据存在，说明使用了单元格内嵌图片能力。
+    assert "xl/richData/rdrichvalue.xml" in names
+    # 第一条分镜对应 C2 单元格。
+    assert 'r="C2"' in sheet_xml

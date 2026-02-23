@@ -13,10 +13,9 @@ from typing import Callable, Iterable
 import regex
 import typer
 from docx import Document
-from openpyxl import Workbook
-from openpyxl.drawing.image import Image as XLImage
-from openpyxl.styles import Alignment, Border, Font, Side
 from PIL import Image
+import xlsxwriter
+from xlsxwriter.exceptions import FileCreateError
 
 DEFAULT_PREFIX_TEXT = """基于五宫格漫画分镜制作二维动漫，严格六宫格分镜布局，全分镜无删减、顺序固定，首帧为Grid0依次到Grid5，镜头切换自然丝滑无卡顿。高饱和配色，色彩浓郁鲜亮且层次分明，人物线条细腻流畅，场景道具还原。人物动作设计充满张力，加入抽帧效果强化动态节奏感，保证整体动态流畅连贯。
 重要限制：
@@ -369,27 +368,9 @@ def build_excel(
     scene_to_image: dict[int, Path],
     prefix_text: str,
 ) -> None:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Sheet1"
-
-    ws.append(["视频标题", "提示词", "图片"])
-
-    thin = Side(style="thin", color="000000")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    # 靠近样例模板的列宽，保证图片落在 C 列可视区域内。
-    ws.column_dimensions["A"].width = 11.88
-    ws.column_dimensions["B"].width = 88.38
-    ws.column_dimensions["C"].width = 52.89
-
-    for row in ws.iter_rows(min_row=1, max_row=1, min_col=1, max_col=3):
-        for cell in row:
-            cell.font = Font(name="微软雅黑", size=12, bold=True)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.border = border
-
-    row_idx = 2
+    # 先做一轮预计算，避免中途异常时生成半成品 Excel。
+    prepared_rows: list[tuple[str, str, Path | None, float]] = []
+    c_col_width = 52.89
     for scene in sorted(scene_groups.keys()):
         scene_key = f"{episode_id}-{scene}"
         scene_text = "\n".join(scene_groups[scene])
@@ -398,35 +379,68 @@ def build_excel(
         if len(prompt) > MAX_EXCEL_CELL_LEN:
             raise AppError("E010", "提示词内容过长，已超过Excel单元格上限，请缩短模板或分镜文本。")
 
-        ws.cell(row=row_idx, column=1, value=scene_key)
-        ws.cell(row=row_idx, column=2, value=prompt)
-
-        ws.cell(row=row_idx, column=1).font = Font(name="微软雅黑", size=11, bold=True)
-        ws.cell(row=row_idx, column=1).alignment = Alignment(horizontal="center", vertical="center")
-        ws.cell(row=row_idx, column=2).font = Font(name="宋体", size=10)
-        ws.cell(row=row_idx, column=2).alignment = Alignment(vertical="top", wrap_text=True)
-
-        for col in (1, 2, 3):
-            ws.cell(row=row_idx, column=col).border = border
-
         row_height_pt = estimate_row_text_height_pt(prompt)
-        if scene in scene_to_image:
-            img_path = scene_to_image[scene]
-            img = XLImage(str(img_path))
-            img_w, img_h = calc_image_size_by_column(img_path, ws.column_dimensions["C"].width)
-            img.width = img_w
-            img.height = img_h
-            img.anchor = f"C{row_idx}"
-            ws.add_image(img)
+        img_path: Path | None = scene_to_image.get(scene)
+        if img_path is not None:
+            _img_w, img_h = calc_image_size_by_column(img_path, c_col_width)
             row_height_pt = max(row_height_pt, pixels_to_points(img_h + IMAGE_PADDING_PX * 2))
 
-        ws.row_dimensions[row_idx].height = min(row_height_pt, MAX_EXCEL_ROW_HEIGHT)
+        prepared_rows.append((scene_key, prompt, img_path, min(row_height_pt, MAX_EXCEL_ROW_HEIGHT)))
 
-        row_idx += 1
+    wb = xlsxwriter.Workbook(str(excel_path))
+    ws = wb.add_worksheet("Sheet1")
+
+    header_fmt = wb.add_format(
+        {
+            "font_name": "微软雅黑",
+            "font_size": 12,
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+        }
+    )
+    title_fmt = wb.add_format(
+        {
+            "font_name": "微软雅黑",
+            "font_size": 11,
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+        }
+    )
+    prompt_fmt = wb.add_format(
+        {
+            "font_name": "宋体",
+            "font_size": 10,
+            "valign": "top",
+            "text_wrap": True,
+            "border": 1,
+        }
+    )
+    image_cell_fmt = wb.add_format({"border": 1, "valign": "vcenter", "align": "center"})
+
+    ws.set_column("A:A", 11.88)
+    ws.set_column("B:B", 88.38)
+    ws.set_column("C:C", c_col_width)
+
+    ws.write(0, 0, "视频标题", header_fmt)
+    ws.write(0, 1, "提示词", header_fmt)
+    ws.write(0, 2, "图片", header_fmt)
+
+    for row_idx, (scene_key, prompt, img_path, row_height_pt) in enumerate(prepared_rows, start=1):
+        ws.set_row(row_idx, row_height_pt)
+        ws.write(row_idx, 0, scene_key, title_fmt)
+        ws.write(row_idx, 1, prompt, prompt_fmt)
+        ws.write_blank(row_idx, 2, None, image_cell_fmt)
+        if img_path is not None:
+            # 使用 Excel 365 的 Place in Cell 语义，避免浮动图层。
+            ws.embed_image(row_idx, 2, str(img_path))
 
     try:
-        wb.save(excel_path)
-    except PermissionError as exc:
+        wb.close()
+    except (PermissionError, FileCreateError) as exc:
         raise AppError("E006", "Excel 写入失败，可能被占用，请关闭后重试。") from exc
 
 
